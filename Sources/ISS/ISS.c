@@ -157,11 +157,19 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
     // Re-enable if the system disabled our tap for being too slow
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         if (globalTap) CGEventTapEnable(globalTap, true);
+        // Anything we posted while disabled never reaches us, so stop waiting for it
+        syntheticEventsToPassThrough = 0;
         return event;
     }
 
     CGSEventType eventType =
         (CGSEventType)CGEventGetIntegerValueField(event, kCGSEventTypeField);
+
+    // Our own events come back within milliseconds; a count left over after the
+    // burst would let real trackpad swipes slip past the override
+    if (syntheticEventsToPassThrough > 0 && !gestures_in_flight()) {
+        syntheticEventsToPassThrough = 0;
+    }
 
     if (syntheticEventsToPassThrough > 0 &&
         (eventType == kCGSEventDockControl || eventType == kCGSEventGesture)) {
@@ -463,10 +471,25 @@ bool iss_can_move(ISSSpaceInfo info, ISSDirection direction) {
 // field is 16.16 fixed point (max ~32767), so the speed setting isn't reused here.
 static const double kModernFlingVelocity = 9999.0;
 
+// Cached natural scrolling preference; -1 means re-read it
+static int naturalScrolling = -1;
+
+// Posted by System Settings when the natural scrolling checkbox is toggled
+static void natural_scrolling_changed(CFNotificationCenterRef center, void *observer,
+                                      CFNotificationName name, const void *object,
+                                      CFDictionaryRef userInfo) {
+    (void)center;
+    (void)observer;
+    (void)name;
+    (void)object;
+    (void)userInfo;
+    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+    naturalScrolling = -1;
+}
+
 // On macOS 27 right is negative, and the Dock reads the posted sign through the
 // natural scrolling preference, so it flips again with natural scrolling off.
 static double iss_modern_swipe_sign(ISSDirection direction) {
-    static int naturalScrolling = -1;
     if (naturalScrolling < 0) {
         Boolean valid = false;
         Boolean natural = CFPreferencesGetAppBooleanValue(CFSTR("com.apple.swipescrolldirection"),
@@ -515,7 +538,9 @@ static bool iss_post_modern_dock_swipe(CGSGesturePhase phase, ISSDirection direc
     }
     CGEventSetIntegerValueField(companion, kCGSEventTypeField, kCGSEventGesture);
 
-    syntheticEventsToPassThrough += 2;
+    if (globalTap) {
+        syntheticEventsToPassThrough += 2;
+    }
     CGEventPost(kCGSessionEventTap, augmented);
     CGEventPost(kCGSessionEventTap, companion);
     CFRelease(augmented);
@@ -666,6 +691,12 @@ bool iss_init(void) {
     CFRunLoopAddSource(CFRunLoopGetMain(), globalSource, kCFRunLoopCommonModes);
     CGEventTapEnable(globalTap, true);
 
+    naturalScrolling = -1;
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDistributedCenter(),
+                                    &naturalScrolling, natural_scrolling_changed,
+                                    CFSTR("SwipeScrollDirectionDidChangeNotification"),
+                                    NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+
     return true;
 }
 
@@ -676,6 +707,10 @@ void iss_destroy(void) {
         predictionsDict = NULL;
     }
     if (globalTap) {
+        CFNotificationCenterRemoveObserver(CFNotificationCenterGetDistributedCenter(),
+                                           &naturalScrolling,
+                                           CFSTR("SwipeScrollDirectionDidChangeNotification"),
+                                           NULL);
         CGEventTapEnable(globalTap, false);
         if (globalSource) {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), globalSource, kCFRunLoopCommonModes);
