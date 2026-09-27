@@ -70,6 +70,9 @@ static bool swipeOverrideEnabled = false;
 static bool swipeTracking = false;
 static bool swipeFired = false;
 
+// Our macOS 27 swipes re-enter the tap with sourcePid == 0, so count them out instead
+static unsigned int syntheticEventsToPassThrough = 0;
+
 // Gesture speed state
 static double gestureSpeed = 2000.0;
 
@@ -141,10 +144,16 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
         return event;
     }
 
-    if (!swipeOverrideEnabled) return event;
-
     CGSEventType eventType =
         (CGSEventType)CGEventGetIntegerValueField(event, kCGSEventTypeField);
+
+    if (syntheticEventsToPassThrough > 0 &&
+        (eventType == kCGSEventDockControl || eventType == kCGSEventGesture)) {
+        syntheticEventsToPassThrough--;
+        return event;
+    }
+
+    if (!swipeOverrideEnabled) return event;
 
     // Pass through synthetic events (non-HID source). Real gesture events
     // from the trackpad have sourcePid == 0 (HID kernel).
@@ -201,6 +210,14 @@ static CGEventRef eventTapCallback(CGEventTapProxy proxy, CGEventType type,
             }
             swipeTracking = false;
             swipeFired = false;
+            if (iss_requires_event_augmentation()) {
+                // On macOS 27 the Dock needs the real ended event to close its gesture
+                // state; zero the motion so it doesn't switch a second time
+                CGEventSetDoubleValueField(event, kCGEventGestureSwipeProgress, 0.0);
+                CGEventSetDoubleValueField(event, kCGEventGestureSwipeVelocityX, 0.0);
+                CGEventSetDoubleValueField(event, kCGEventGestureSwipeVelocityY, 0.0);
+                return event;
+            }
             return NULL;
         }
 
@@ -426,19 +443,81 @@ bool iss_can_move(ISSSpaceInfo info, ISSDirection direction) {
     return !iss_should_block_switch(&info, direction);
 }
 
+// The fling on the ended phase is what commits the switch on macOS 27. The payload
+// field is 16.16 fixed point (max ~32767), so the speed setting isn't reused here.
+static const double kModernFlingVelocity = 9999.0;
+
+// On macOS 27 right is negative, and the Dock reads the posted sign through the
+// natural scrolling preference, so it flips again with natural scrolling off.
+static double iss_modern_swipe_sign(ISSDirection direction) {
+    static int naturalScrolling = -1;
+    if (naturalScrolling < 0) {
+        Boolean valid = false;
+        Boolean natural = CFPreferencesGetAppBooleanValue(CFSTR("com.apple.swipescrolldirection"),
+                                                          kCFPreferencesAnyApplication, &valid);
+        naturalScrolling = (!valid || natural) ? 1 : 0;
+    }
+    const double sign = (direction == ISSDirectionRight) ? -1.0 : 1.0;
+    return naturalScrolling ? sign : -sign;
+}
+
+static bool iss_post_modern_dock_swipe(CGSGesturePhase phase, ISSDirection direction) {
+    const double sign = iss_modern_swipe_sign(direction);
+
+    CGEventRef ev = CGEventCreate(NULL);
+    if (!ev) {
+        return false;
+    }
+    CGEventSetIntegerValueField(ev, kCGSEventTypeField, kCGSEventDockControl);
+    CGEventSetIntegerValueField(ev, kCGEventGestureHIDType, kIOHIDEventTypeDockSwipe);
+    CGEventSetIntegerValueField(ev, kCGEventGesturePhase, phase);
+    CGEventSetIntegerValueField(ev, kCGEventGestureSwipeMotion, kCGGestureMotionHorizontal);
+    // Near-zero progress (the smallest non-zero 16.16 value) leaves nothing to animate.
+    // Full progress switches too, but the previous space flashes before it lands.
+    CGEventSetDoubleValueField(ev, kCGEventGestureSwipeProgress, sign * 0.000016);
+    // Fields a real trackpad swipe carries (from FasterSwiper's traces).
+    CGEventSetIntegerValueField(ev, kCGEventGesturePhaseAlias, phase);
+    CGEventSetDoubleValueField(ev, kCGEventGestureZoomDeltaY, 3.0);
+    CGEventSetDoubleValueField(ev, kCGEventSourceUnixProcessIDAlias, (double)mach_absolute_time());
+    CGEventSetDoubleValueField(ev, kCGEventGestureSwipePositionX, 0.1);
+    // Match FasterSwiper: only the Ended event carries velocity.
+    if (phase == kCGSGesturePhaseEnded) {
+        CGEventSetDoubleValueField(ev, kCGEventGestureSwipeVelocityX, sign * kModernFlingVelocity);
+    }
+
+    CGEventRef augmented = iss_augment_dock_swipe_event(ev);
+    CFRelease(ev);
+    if (!augmented) {
+        return false;
+    }
+
+    // The Dock ignores a DockControl event without a companion gesture event
+    CGEventRef companion = CGEventCreate(NULL);
+    if (!companion) {
+        CFRelease(augmented);
+        return false;
+    }
+    CGEventSetIntegerValueField(companion, kCGSEventTypeField, kCGSEventGesture);
+
+    syntheticEventsToPassThrough += 2;
+    CGEventPost(kCGSessionEventTap, augmented);
+    CGEventPost(kCGSessionEventTap, companion);
+    CFRelease(augmented);
+    CFRelease(companion);
+    return true;
+}
+
 static bool iss_post_dock_swipe(CGSGesturePhase phase, ISSDirection direction, double velocity) {
+    if (iss_requires_event_augmentation()) {
+        return iss_post_modern_dock_swipe(phase, direction);
+    }
+
     const bool isRight = (direction == ISSDirectionRight);
-    
-    // On macOS 27 the Dock server's interpretation of positive/negative
-    // progress and velocity is inverted relative to the app's internal
-    // direction model. Flip the sign for the augmented path only.
-    const double progress = iss_requires_event_augmentation()
-                                ? (isRight ? -0.000016 : 0.000016)
-                                : (isRight ? (double)FLT_TRUE_MIN : -(double)FLT_TRUE_MIN);
+    // Empirically, ±FLT_TRUE_MIN used in this way makes switching instant.
+    const double progress = isRight ? (double)FLT_TRUE_MIN : -(double)FLT_TRUE_MIN;
 
     // Velocity of gesture based on speed setting
     const double vel = isRight ? velocity : -velocity;
-    const double modernVel = isRight ? -velocity : velocity;
 
     CGEventRef ev = CGEventCreate(NULL);
     if (!ev) {
@@ -449,29 +528,6 @@ static bool iss_post_dock_swipe(CGSGesturePhase phase, ISSDirection direction, d
     CGEventSetIntegerValueField(ev, kCGEventGesturePhase, phase);
     CGEventSetDoubleValueField(ev, kCGEventGestureSwipeProgress, progress);
     CGEventSetIntegerValueField(ev, kCGEventGestureSwipeMotion, kCGGestureMotionHorizontal);
-
-    if (iss_requires_event_augmentation()) {
-        CGEventSetIntegerValueField(ev, kCGEventGesturePhaseAlias, phase);
-        CGEventSetDoubleValueField(ev, kCGEventGestureZoomDeltaY, 3.0);
-        CGEventSetDoubleValueField(ev, kCGEventSourceUnixProcessIDAlias,
-                                    (double)mach_absolute_time());
-        CGEventSetDoubleValueField(ev, kCGEventGestureSwipePositionX, 0.1);
-
-        // Match FasterSwiper: only the Ended event carries velocity.
-        if (phase == kCGSGesturePhaseEnded) {
-            CGEventSetDoubleValueField(ev, kCGEventGestureSwipeVelocityX, modernVel);
-        }
-
-        CGEventRef augmented = iss_augment_dock_swipe_event(ev);
-        CFRelease(ev);
-        if (!augmented) {
-            return false;
-        }
-        CGEventPost(kCGSessionEventTap, augmented);
-        CFRelease(augmented);
-        return true;
-    }
-
     CGEventSetDoubleValueField(ev, kCGEventGestureSwipeVelocityX, vel);
     CGEventSetDoubleValueField(ev, kCGEventGestureSwipeVelocityY, vel);
     CGEventPost(kCGSessionEventTap, ev);
@@ -597,6 +653,7 @@ bool iss_init(void) {
 }
 
 void iss_destroy(void) {
+    syntheticEventsToPassThrough = 0;
     if (predictionsDict) {
         CFRelease(predictionsDict);
         predictionsDict = NULL;
