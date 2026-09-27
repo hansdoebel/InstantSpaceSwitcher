@@ -81,8 +81,24 @@ static ISSSwitchCallback switchCallback = NULL;
 // Predictions dictionary: DisplayID (CFStringRef) -> Index (CFNumberRef)
 static CFMutableDictionaryRef predictionsDict = NULL;
 
+// While our own gestures are still being animated, CGS reports an
+// intermediate space and the Dock fires space-change notifications for each
+// hop. Trusting either during a burst makes us overshoot past the last space,
+// which on macOS 27 wedges the Dock (black screen) until it times out. Keep
+// predictions authoritative until the Dock has been quiet for this long.
+static const CFTimeInterval kPredictionTTL = 1.0;
+static CFAbsoluteTime lastGestureTime = 0;
+
+static bool gestures_in_flight(void) {
+    return CFAbsoluteTimeGetCurrent() - lastGestureTime < kPredictionTTL;
+}
+
 static bool get_prediction(const char *displayID, unsigned int *outIndex) {
     if (!displayID || !predictionsDict) return false;
+    if (!gestures_in_flight()) {
+        CFDictionaryRemoveAllValues(predictionsDict);
+        return false;
+    }
     
     CFStringRef key = CFStringCreateWithCString(NULL, displayID, kCFStringEncodingUTF8);
     const void *value = CFDictionaryGetValue(predictionsDict, key);
@@ -538,6 +554,7 @@ static bool iss_post_dock_swipe(CGSGesturePhase phase, ISSDirection direction, d
 static bool iss_perform_switch_gesture(ISSDirection direction, double velocity) {
     // Send three gesture events--began, changed, and ended
     // If we only send two then mission control doesn't work.
+    lastGestureTime = CFAbsoluteTimeGetCurrent();
     return iss_post_dock_swipe(kCGSGesturePhaseBegan,   direction, velocity)
         && iss_post_dock_swipe(kCGSGesturePhaseChanged, direction, velocity)
         && iss_post_dock_swipe(kCGSGesturePhaseEnded,   direction, velocity);
@@ -767,6 +784,9 @@ void iss_set_gesture_speed(double speed) {
 }
 
 void iss_reset_predictions(void) {
+    // Space-change notifications fire for every intermediate hop of our own
+    // gestures; ignore them until the burst has settled.
+    if (gestures_in_flight()) return;
     if (predictionsDict) {
         CFDictionaryRemoveAllValues(predictionsDict);
     }
